@@ -1,1 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Zombie Escape — Discrete Hand Actions</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.6.0/p5.min.js"></script>
+  <script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+
+  <style>
+    html,body { margin:0; padding:0; height:100%; background:#000; overflow:hidden; }
+    canvas { display:block; }
+    #overlay {
+      position: absolute; left:10px; top:10px; z-index:10;
+      background: rgba(0,0,0,0.5); color:#fff; padding:10px 14px; border-radius:8px;
+      font-family: Arial, sans-serif; font-size:14px;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    🧟‍♂️ <b>Zombie Escape</b> — Right hand up = Jump • Left hand up = Crouch • Lean to change lanes<br>
+    Auto-calibrating: stand visible for ~1s
+  </div>
+
+<script>
+/*  Discrete-action version:
+    - Right hand up triggers a short Jump action (fixed duration)
+    - Left hand up triggers a short Crouch action (fixed duration)
+    - Leaning (shoulder midpoint) changes lane continuously
+    - No continuous vertical mirroring of the avatar
+    - Low-res PoseNet input for performance
+*/
+
+// ----------------- TUNEABLE CONSTANTS -----------------
+const VIDEO_W = 320, VIDEO_H = 240;   // PoseNet input size (low-res => faster)
+const MIN_CONF = 0.45;
+const BASELINE_FRAMES = 30;           // ~1 second baseline collection
+const WRIST_UP_DELTA = 60;            // px above baseline to consider "hand up"
+const DODGE_THRESHOLD = 0.18;         // normalized shoulder shift for lane change
+const SMOOTH_ALPHA = 0.32;            // ewma smoothing
+
+// action durations (ms)
+const JUMP_DURATION = 600;
+const CROUCH_DURATION = 600;
+
+// zombies + collisions (smaller/harder)
+const LANE_COUNT = 3;
+const ZOMBIE_W = 18, ZOMBIE_H = 30;
+const COLLIDE_DIST = 30; // reduced collision radius
+
+let SPAWN_BASE_MS = 1100;
+let SPAWN_MIN_MS = 600;
+let SPAWN_ACCEL = 0.99;
+let ZOMBIE_SPEED_MIN = -2.2, ZOMBIE_SPEED_MAX = -4.2;
+
+// ----------------- GLOBAL STATE -----------------
+let video, poseNet, poses = [];
+let smoothed = {};
+function ewma(k,v,a=SMOOTH_ALPHA){ if (!(k in smoothed)) smoothed[k]=v; smoothed[k]=a*v + (1-a)*smoothed[k]; return smoothed[k]; }
+
+let baseline = null, baselineFrameCount = 0, calibrated = false;
+
+let canvasW, canvasH;
+let lanes = [];
+let playerLane = 1;
+let action = { jump:false, crouch:false, jumpUntil:0, crouchUntil:0 };
+let zombies = [];
+let spawnTimer = 0, spawnInterval = SPAWN_BASE_MS;
+let score = 0, lastScoreTick = 0;
+let gameRunning = false, gameOver = false;
+
+// ----------------- SETUP -----------------
+function setup(){
+  canvasW = windowWidth; canvasH = windowHeight;
+  createCanvas(canvasW, canvasH);
+
+  // low-res capture to reduce load
+  video = createCapture({
+    video: { width: VIDEO_W, height: VIDEO_H, facingMode: "user" }
+  }, ()=>{ /* ready */ });
+  video.size(VIDEO_W, VIDEO_H);
+  video.hide();
+
+  poseNet = ml5.poseNet(video, 'single', ()=>console.log('PoseNet ready'));
+  poseNet.on('pose', r => poses = r);
+
+  for (let i=0;i<LANE_COUNT;i++) lanes.push(canvasW*(0.22 + i*0.28));
+
+  lastScoreTick = millis();
+  textFont('Arial');
+}
+
+function windowResized(){
+  resizeCanvas(windowWidth, windowHeight);
+  canvasW = windowWidth; canvasH = windowHeight;
+  lanes = []; for (let i=0;i<LANE_COUNT;i++) lanes.push(canvasW*(0.22 + i*0.28));
+}
+
+// ----------------- MAIN LOOP -----------------
+function draw(){
+  background(0);
+
+  // draw mirrored video (so the user sees a mirror)
+  push(); translate(width,0); scale(-1,1); image(video,0,0,width,height); pop();
+
+  // small translucent overlay removed (you asked to remove black screen)
+  // process pose each frame
+  processPose();
+
+  // handle game start after calibration
+  if (!calibrated){
+    drawCenteredText("Calibrating camera — stand visible for ~1s", 20, color(255));
+    return;
+  } else {
+    if (!gameRunning && !gameOver) {
+      gameRunning = true; // auto-start after calibration
+    }
+  }
+
+  if (gameRunning && !gameOver){
+    spawnTimer += deltaTime;
+    if (spawnTimer > spawnInterval){
+      spawnZombie();
+      spawnTimer = 0;
+      spawnInterval = max(SPAWN_MIN_MS, spawnInterval * SPAWN_ACCEL);
+    }
+
+    updateZombies();
+    drawZombies();
+    drawPlayer();
+
+    if (millis() - lastScoreTick >= 1000){
+      score += 1;
+      lastScoreTick = millis();
+    }
+    drawHUD();
+  } else if (gameOver){
+    drawZombies();
+    drawPlayer();
+    drawCenteredText("GAME OVER\nScore: " + nf(score,1,0) + "\nReload to play again", 36, color(255,80,80));
+  }
+}
+
+// ----------------- POSE PROCESSING -----------------
+function mirrorKP(kp){
+  if (!kp) return {x:0,y:0,confidence:0};
+  // scale PoseNet coords (VIDEO_W/VIDEO_H) into canvas and mirror X
+  return {
+    x: width - (kp.x * (width / VIDEO_W)),
+    y: kp.y * (height / VIDEO_H),
+    confidence: kp.confidence
+  };
+}
+
+function processPose(){
+  if (!poses || !poses[0] || !poses[0].pose) return;
+  const p = poses[0].pose;
+
+  const leftW = mirrorKP(p.leftWrist);
+  const rightW = mirrorKP(p.rightWrist);
+  const leftS = mirrorKP(p.leftShoulder);
+  const rightS = mirrorKP(p.rightShoulder);
+
+  const conf = (leftW.confidence + rightW.confidence + leftS.confidence + rightS.confidence) / 4;
+  if (conf < MIN_CONF) return;
+
+  // smooth values
+  const sLWY = ewma('lW_y', leftW.y);
+  const sRWY = ewma('rW_y', rightW.y);
+  const sShoulderX = ewma('shoulderX', (leftS.x + rightS.x)/2);
+  const sShoulderW = ewma('shoulderW', dist(leftS.x,leftS.y, rightS.x, rightS.y));
+
+  // baseline auto-calibration (averaging over frames)
+  if (!calibrated){
+    baselineFrameCount++;
+    if (!baseline) baseline = { lW_y: sLWY, rW_y: sRWY, shoulderX: sShoulderX, shoulderW: sShoulderW };
+    else {
+      baseline.lW_y = (baseline.lW_y*(baselineFrameCount-1) + sLWY)/baselineFrameCount;
+      baseline.rW_y = (baseline.rW_y*(baselineFrameCount-1) + sRWY)/baselineFrameCount;
+      baseline.shoulderX = (baseline.shoulderX*(baselineFrameCount-1) + sShoulderX)/baselineFrameCount;
+      baseline.shoulderW = (baseline.shoulderW*(baselineFrameCount-1) + sShoulderW)/baselineFrameCount;
+    }
+    if (baselineFrameCount >= BASELINE_FRAMES){
+      calibrated = true;
+      console.log('Calibrated baseline:', baseline);
+    }
+    return;
+  }
+
+  // ----- DISCRETE TRIGGER LOGIC -----
+  // Right wrist up triggers jump (edge-triggered)
+  if (sRWY < baseline.rW_y - WRIST_UP_DELTA){
+    // only trigger if not already jumping (prevents re-trigger while hand still up)
+    if (!action.jump && millis() > action.jumpUntil){
+      action.jump = true;
+      action.jumpUntil = millis() + JUMP_DURATION;
+    }
+  }
+  // Left wrist up triggers crouch (edge-triggered)
+  if (sLWY < baseline.lW_y - WRIST_UP_DELTA){
+    if (!action.crouch && millis() > action.crouchUntil){
+      action.crouch = true;
+      action.crouchUntil = millis() + CROUCH_DURATION;
+    }
+  }
+
+  // expire actions when timers pass
+  if (action.jump && millis() > action.jumpUntil) action.jump = false;
+  if (action.crouch && millis() > action.crouchUntil) action.crouch = false;
+
+  // lane mapping by shoulder lean (continuous)
+  const dxNorm = (sShoulderX - baseline.shoulderX) / baseline.shoulderW;
+  if (dxNorm < -DODGE_THRESHOLD) playerLane = 0;
+  else if (dxNorm > DODGE_THRESHOLD) playerLane = 2;
+  else playerLane = 1;
+}
+
+// ----------------- PLAYER DRAW -----------------
+function drawPlayer(){
+  const px = lanes[playerLane];
+  const baseY = height * 0.78;
+  let yOff = 0;
+  if (action.jump) yOff = -90;
+  if (action.crouch) yOff = 40;
+
+  push();
+  translate(px, baseY + yOff);
+  noStroke();
+  fill(100,200,255);
+  rectMode(CENTER);
+  rect(0, 0, 34, 52, 8);
+  fill(255,230,200);
+  ellipse(0, -44, 30, 30);
+  pop();
+}
+
+// ----------------- ZOMBIES -----------------
+function spawnZombie(){
+  const lane = floor(random(0, LANE_COUNT));
+  const r = random();
+  const type = r < 0.5 ? 'zombie' : (r < 0.8 ? 'ground' : 'air');
+  const speed = random(ZOMBIE_SPEED_MAX, ZOMBIE_SPEED_MIN);
+  zombies.push({ x: width + 80 + lane*18, lane, type, speed, alive:true });
+}
+
+function updateZombies(){
+  for (let z of zombies){
+    z.x += z.speed * (deltaTime/16);
+    const playerX = lanes[playerLane];
+    if (z.alive && abs(z.x - playerX) < COLLIDE_DIST){
+      let safe = false;
+      if (z.type === 'ground' && action.jump) safe = true;
+      if (z.type === 'air' && action.crouch) safe = true;
+      if (z.type === 'zombie' && playerLane !== z.lane) safe = true;
+      if (!safe){
+        gameOver = true;
+        gameRunning = false;
+      } else {
+        z.alive = false;
+      }
+    }
+  }
+  zombies = zombies.filter(z => z.x > -120);
+}
+
+function drawZombies(){
+  for (let z of zombies){
+    const zx = z.x;
+    const zy = height * 0.78 + (z.type==='air' ? -44 : 0);
+    push();
+    rectMode(CENTER);
+    fill(z.type==='zombie' ? color(120,220,120) : color(255,100,100));
+    rect(zx, zy - (ZOMBIE_H/2), ZOMBIE_W, ZOMBIE_H, 6);
+    fill(30); ellipse(zx, zy - (ZOMBIE_H/2) - 16, 16, 16);
+    pop();
+  }
+}
+
+// ----------------- HUD & UTIL -----------------
+function drawHUD(){
+  fill(255); textSize(16); textAlign(LEFT, TOP);
+  text('Score: ' + nf(score,1,0), 12, 12);
+  text('Calibrated: ' + (calibrated ? 'YES' : 'NO'), 12, 34);
+  if (gameRunning && !gameOver){
+    if (millis() - lastScoreTick >= 1000){ score++; lastScoreTick = millis(); }
+  }
+}
+
+function drawCenteredText(txt, size, col){
+  push(); textAlign(CENTER, CENTER); fill(col); textSize(size); text(txt, width/2, height/2); pop();
+}
+</script>
+</body>
+</html>
 
