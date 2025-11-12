@@ -93,7 +93,7 @@ You can safely play offline — all ML runs locally in your browser.
 
 ## 🧠 Example Localhost URL
 
-If opened through PyCharm (like in your screenshot),  
+If opened through PyCharm (like in screenshot),  
 your address bar will show something similar to:
 
 http://localhost:63342/PythonProject7/index.html?_ijt=abcdef123456&_ij_reload=RELOAD_ON_SAVE
@@ -115,6 +115,7 @@ You can refresh or reload at any time — the query string simply allows PyCharm
 
 ## 📸 Screenshots
 
+![screenshot](https://github.com/user-attachments/assets/1e051058-9124-48ca-9f92-7b3003a71131)
 
 ---
 
